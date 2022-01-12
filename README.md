@@ -31,7 +31,7 @@ torchvision.models.resnet50()
 
 
 ## Results
-![](./result.png)
+![](/result.png)
 
 
 ## Summary
