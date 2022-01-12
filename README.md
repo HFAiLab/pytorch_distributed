@@ -1,25 +1,40 @@
-# pytorch_distribute_test
+# PyTorch Distributed Test on High-Flyer AIHPC
 
-测试不同的Pytorch并行训练加速方案，基于imagenet数据，resnet模型
+We test the different implementations of PyTorch distributed training, and compare the performances.
 
-+ single GPU，使用一个GPU进行深度学习模型训练
-+ nn.DataParallel，简单方便的DataParallel，单进程管理
-+ torch.distributed + torch.multiprocessing，distributed并行加速，多进程管理
-+ apex，apex再加速
++ single GPU
++ [nn.DataParallel](https://pytorch.org/docs/stable/generated/torch.nn.DataParallel.html)
++ [torch.distributed + torch.multiprocessing](https://pytorch.org/docs/stable/distributed.html#:~:text=Otherwise%2C%20torch.distributed%20does%20not%20expose%20any%20other%20APIs.,USE_DISTRIBUTED%3D1%20for%20Linux%20and%20Windows%2C%20USE_DISTRIBUTED%3D0%20for%20MacOS.)
++ [Apex](https://github.com/NVIDIA/apex)
+
+We recommend that users use `Apex` to conduct distributed training on High-Flyer AIHPC.
 
 
-### 重要参数
+## Dataset
+**ImageNet**. We use [ffrecord](https://github.com/HFAiLab/ffrecord) to aggregate the scattered files on High-Flyer AIHPC.
+```
+train_data = '/public_dataset/1/ImageNet/train.ffr'
+val_data = '/public_dataset/1/ImageNet/val.ffr'
+```
+
+## Test Model
+ResNet
+```
+torchvision.models.resnet50()
+```
+
+
+## Parameters
 + batch_size: 400
-    + 每个GPU分配400个sample，填满40G显存
-+ 节点数： 1
-+ 显卡数： 8
++ num_nodes： 1
++ gpus： 8
 
-### 测试结果
-| 测试项 | 每Epoch用时（秒） | GPU利用率 | 显存占用率 |
-| --- | ---| --- | --- |
-| single GPU | 1786.7849 | 99.5% | 99.8% |
-| nn.DataParallel | 984.5840 | 59.8% | 99.8% |
-| torch.distributed | 239.3970 | 99.5% | 99.8% |
-| hfai.nccl.distributed | 236.7068 | 99.5% | 99.8% |
-| apex | 230.9803 | 88.8% | 61.2% |
-| apex *4 | 54.5026 | 79.2% | 61.2% |
+
+## Results
+![](./result.png)
+
+
+## Summary
+1. `Apex` is the most effective implementation to conduct PyTorch distributed training for now.
+2. The acceleration effect is basically the same as the number of GPU.
+3. The deeper the degree of parallelism, the lower the utilization of GPU.
