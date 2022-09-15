@@ -1,65 +1,43 @@
 import hf_env
-hf_env.set_env('202105')
+hf_env.set_env('202111')
 
 import os
 import time
-import pickle
 from pathlib import Path
 import torch
-import torchvision
 from torch import nn
-import torch.distributed as dist
-from torch.multiprocessing import Process
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import SGD
 from torch.optim.lr_scheduler import StepLR
 from torchvision import transforms, models
 
-from apex import amp
-from apex.parallel import DistributedDataParallel
-
-from ffrecord.torch import Dataset, DataLoader
-
 import hfai
-hfai.client.bind_hf_except_hook(Process)
+import hfai.nccl.distributed as dist
+from hfai.nn.parallel import DistributedDataParallel
 
 
-class FireFlyerImageNet(Dataset):
-    def __init__(self, fnames, transform=None):
-        super(FireFlyerImageNet, self).__init__(fnames, check_data=True)
-        self.transform = transform
-
-    def process(self, indexes, data):
-        samples = []
-
-        for bytes_ in data:
-            img, label = pickle.loads(bytes_)
-            if self.transform:
-                img = self.transform(img)
-            samples.append((img, label))
-
-        return samples
-
-
-def train(dataloader, model, criterion, optimizer, scheduler, epoch, local_rank,
-          start_step, best_acc, save_path):
+def train(dataloader, model, criterion, optimizer, scheduler, loss_scaler, epoch, local_rank, start_step, best_acc, save_path):
     model.train()
     for step, batch in enumerate(dataloader):
         if step < start_step:
             continue
 
         samples, labels = [x.cuda(non_blocking=True) for x in batch]
-        outputs = model(samples)
-        loss = criterion(outputs, labels)
 
+        with torch.cuda.amp.autocast():
+            outputs = model(samples)
+            loss = criterion(outputs, labels)
+        loss_scaler.scale(loss).backward()
+        
+        loss_scaler.step(optimizer)
+        loss_scaler.update()
         optimizer.zero_grad()
-        with amp.scale_loss(loss, optimizer) as scaled_loss:
-            scaled_loss.backward()
-        optimizer.step()
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
         # 保存
-        rank = torch.distributed.get_rank()
-        if rank == 0 and hfai.receive_suspend_command():
+        if dist.get_rank() == 0 and local_rank == 0 and hfai.client.receive_suspend_command():
             state = {
                 'model': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
@@ -68,9 +46,9 @@ def train(dataloader, model, criterion, optimizer, scheduler, epoch, local_rank,
                 'epoch': epoch,
                 'step': step + 1
             }
-            torch.save(state, os.path.join(save_path, 'latest.pt'))
+            torch.save(state, save_path / 'latest.pt')
             time.sleep(5)
-            hfai.go_suspend()
+            hfai.client.go_suspend()
 
 
 def validate(dataloader, model, criterion, epoch, local_rank):
@@ -106,11 +84,8 @@ def main(local_rank):
     lr = 0.1
     momentum = 0.9
     weight_decay = 1e-4
-    save_path = 'output/resnet_ddp'
-    Path(save_path).mkdir(exist_ok=True, parents=True)
-
-    train_data = '/public_dataset/1/ImageNet/train.ffr'
-    val_data = '/public_dataset/1/ImageNet/val.ffr'
+    save_path = Path('output/resnet_ddp_amp')
+    save_path.mkdir(exist_ok=True, parents=True)
 
     # 多机通信
     ip = os.environ['MASTER_IP']
@@ -125,84 +100,61 @@ def main(local_rank):
 
     # 模型、数据、优化器
     model = models.resnet50().cuda()
-    criterion = nn.CrossEntropyLoss().cuda()
-    optimizer = SGD(model.parameters(), lr=lr,  momentum=momentum, weight_decay=weight_decay)
-    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
-
-    model, optimizer = amp.initialize(model, optimizer)
     model = DistributedDataParallel(model)
 
+    criterion = nn.CrossEntropyLoss()
+    optimizer = SGD(model.parameters(), lr=lr,  momentum=momentum, weight_decay=weight_decay)
+    loss_scaler = torch.cuda.amp.GradScaler(enabled=True)
+    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+    
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])  # 定义训练集变换
-    train_dataset = FireFlyerImageNet(train_data, transform=train_transform)
+    train_dataset = hfai.datasets.ImageNet(split='train', transform=train_transform)
     train_datasampler = DistributedSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset,
-                                  batch_size,
-                                  sampler=train_datasampler,
-                                  num_workers=num_workers,
-                                  pin_memory=True)
+    train_dataloader = train_dataset.loader(train_dataset, batch_size, sampler=train_datasampler, num_workers=num_workers, pin_memory=True)
 
     val_transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])  # 定义测试集变换
-    val_dataset = FireFlyerImageNet(val_data, transform=val_transform)
+    val_dataset = hfai.datasets.ImageNet(split='val', transform=val_transform)
     val_datasampler = DistributedSampler(val_dataset)
-    val_dataloader = DataLoader(val_dataset,
-                                batch_size,
-                                sampler=val_datasampler,
-                                num_workers=num_workers,
-                                pin_memory=True)
+    val_dataloader = val_dataset.loader(val_dataset, batch_size, sampler=val_datasampler, num_workers=num_workers, pin_memory=True)
 
     # 加载
     best_acc, start_epoch, start_step = 0, 0, 0
-    if os.path.exists(os.path.join(save_path, 'latest.pt')):
-        ckpt = torch.load(os.path.join(save_path, 'latest.pt'),
-                          map_location='cpu')
+    if (save_path / 'latest.pt').exists():
+        ckpt = torch.load(save_path / 'latest.pt', map_location='cpu')
         model.module.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
-        best_acc, start_epoch = ckpt['acc'], ckpt['epoch']
-        start_step = ckpt['step']
+        best_acc, start_epoch, start_step = ckpt['acc'], ckpt['epoch'], ckpt['step']
 
     # 训练、验证
     for epoch in range(start_epoch, epochs):
         t1 = time.time()
         train_datasampler.set_epoch(epoch)
-        train(train_dataloader, model, criterion, optimizer, scheduler, epoch, local_rank, start_step, best_acc, save_path)
+        train(train_dataloader, model, criterion, optimizer, scheduler, loss_scaler, epoch, local_rank, start_step, best_acc, save_path)
         start_step = 0 
         scheduler.step()
         acc = validate(val_dataloader, model, criterion, epoch, local_rank)
         t2 = time.time()
-        torch.cuda.empty_cache()
 
         # 保存
         if rank == 0 and local_rank == 0:
             print("cost time per epoch: {:.4f} s".format(t2-t1))
-            state = {
-                'model': model.module.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'acc': best_acc,
-                'epoch': epoch + 1,
-                'step': 0
-            }
-            torch.save(state, os.path.join(save_path, 'latest.pt'))
             if acc > best_acc:
                 best_acc = acc
                 print(f'New Best Acc: {100*acc:.2f}%!')
-                torch.save(model.module.state_dict(),
-                           os.path.join(save_path, 'best.pt'))
+                torch.save(model.module.state_dict(), save_path / 'best.pt')
 
 
 if __name__ == '__main__':
     ngpus = torch.cuda.device_count()
-    torch.multiprocessing.spawn(main, args=(), nprocs=ngpus)
+    hfai.multiprocessing.spawn(main, args=(), nprocs=ngpus, bind_numa=True)

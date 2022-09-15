@@ -1,36 +1,14 @@
 import hf_env
-hf_env.set_env('202105')
+hf_env.set_env('202111')
 
-import os
 import time
-import pickle
 from pathlib import Path
 import torch
-import torchvision
 from torch import nn
 from torch.optim import SGD
 from torch.optim.lr_scheduler import StepLR
 from torchvision import transforms, models
-
-from ffrecord.torch import Dataset, DataLoader
 import hfai
-
-
-class FireFlyerImageNet(Dataset):
-    def __init__(self, fnames, transform=None):
-        super(FireFlyerImageNet, self).__init__(fnames, check_data=True)
-        self.transform = transform
-
-    def process(self, indexes, data):
-        samples = []
-
-        for bytes_ in data:
-            img, label = pickle.loads(bytes_)
-            if self.transform:
-                img = self.transform(img)
-            samples.append((img, label))
-
-        return samples
 
 
 def train(dataloader, model, criterion, optimizer, scheduler, epoch, start_step, best_acc, save_path):
@@ -46,8 +24,11 @@ def train(dataloader, model, criterion, optimizer, scheduler, epoch, start_step,
         loss.backward()
         optimizer.step()
 
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
         # 保存
-        if hfai.receive_suspend_command():
+        if hfai.client.receive_suspend_command():
             state = {
                 'model': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
@@ -56,9 +37,9 @@ def train(dataloader, model, criterion, optimizer, scheduler, epoch, start_step,
                 'epoch': epoch,
                 'step': step + 1
             }
-            torch.save(state, os.path.join(save_path, 'latest.pt'))
+            torch.save(state, save_path / 'latest.pt')
             time.sleep(5)
-            hfai.go_suspend()
+            hfai.client.go_suspend()
 
 
 def validate(dataloader, model, criterion, epoch):
@@ -90,8 +71,8 @@ def main():
     lr = 0.1
     momentum = 0.9
     weight_decay = 1e-4
-    save_path = 'output/resnet_dp'
-    Path(save_path).mkdir(exist_ok=True, parents=True)
+    save_path = Path('output/resnet_dp')
+    save_path.mkdir(exist_ok=True, parents=True)
 
     gpus = [0,1,2,3,4,5,6,7]
 
@@ -99,29 +80,24 @@ def main():
     model = models.resnet50()
     torch.cuda.set_device('cuda:{}'.format(gpus[0]))
     model = nn.DataParallel(model.cuda(), device_ids=gpus, output_device=gpus[0])
-    
-    train_data = '/public_dataset/1/ImageNet/train.ffr'
-    val_data = '/public_dataset/1/ImageNet/val.ffr'
 
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])  # 定义训练集变换
-    train_dataset = FireFlyerImageNet(train_data, transform=train_transform)
-    train_dataloader = DataLoader(train_dataset, batch_size, num_workers=num_workers, pin_memory=True)
+    train_dataset = hfai.datasets.ImageNet(split='train', transform=train_transform)
+    train_dataloader = train_dataset.loader(train_dataset, batch_size, num_workers=num_workers, pin_memory=True)
 
     val_transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])  # 定义测试集变换
-    val_dataset = FireFlyerImageNet(val_data, transform=val_transform)
-    val_dataloader = DataLoader(val_dataset, batch_size, num_workers=num_workers, pin_memory=True)
+    val_dataset = hfai.datasets.ImageNet(split='val', transform=val_transform)
+    val_dataloader = val_dataset.loader(val_dataset, batch_size, num_workers=num_workers, pin_memory=True)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
@@ -129,13 +105,12 @@ def main():
 
     # 加载
     best_acc, start_epoch, start_step = 0, 0, 0
-    if os.path.exists(os.path.join(save_path, 'latest.pt')):
-        ckpt = torch.load(os.path.join(save_path, 'latest.pt'), map_location='cpu')
+    if (save_path /'latest.pt').exists():
+        ckpt = torch.load(save_path / 'latest.pt', map_location='cpu')
         model.module.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
-        best_acc, start_epoch = ckpt['acc'], ckpt['epoch']
-        start_step = ckpt['step']
+        best_acc, start_epoch, start_step = ckpt['acc'], ckpt['epoch'], ckpt['step']
 
     # 训练、验证
     for epoch in range(start_epoch, epochs):
@@ -148,19 +123,10 @@ def main():
         torch.cuda.empty_cache()
 
         print("cost time per epoch: {:.4f} s".format(t2-t1))
-        state = {
-            'model': model.module.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'acc': best_acc,
-            'epoch': epoch + 1,
-            'step': 0
-        }
-        torch.save(state, os.path.join(save_path, 'latest.pt'))
         if acc > best_acc:
             best_acc = acc
             print(f'New Best Acc: {100*acc:.2f}%!')
-            torch.save(model.module.state_dict(), os.path.join(save_path, 'best.pt'))
+            torch.save(model.module.state_dict(), save_path / 'best.pt')
 
 
 if __name__ == '__main__':
