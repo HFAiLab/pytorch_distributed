@@ -92,7 +92,7 @@ def main():
                              std=[0.229, 0.224, 0.225])
     ])  # 定义训练集变换
     train_dataset = hfai.datasets.ImageNet(split='train', transform=train_transform)
-    train_dataloader = train_dataset.loader(train_dataset, batch_size, num_workers=num_workers, pin_memory=True)
+    train_dataloader = train_dataset.loader(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
 
     val_transform = transforms.Compose([
         transforms.Resize(256),
@@ -102,7 +102,7 @@ def main():
                              std=[0.229, 0.224, 0.225])
     ])  # 定义测试集变换
     val_dataset = hfai.datasets.ImageNet(split='val', transform=val_transform)
-    val_dataloader = val_dataset.loader(val_dataset, batch_size, num_workers=num_workers, pin_memory=True)
+    val_dataloader = val_dataset.loader(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
